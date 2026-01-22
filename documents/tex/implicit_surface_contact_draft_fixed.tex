@@ -1,0 +1,499 @@
+% !TeX program = xelatex
+\documentclass[UTF8,a4paper,12pt]{ctexart}
+
+\usepackage{geometry}
+\geometry{margin=2.2cm}
+\usepackage{amsmath,amssymb,amsthm,bm,mathtools}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue}
+
+% Theorem environments
+\newtheorem{theorem}{定理}
+\newtheorem{lemma}{引理}
+\newtheorem{proposition}{命题}
+\newtheorem{corollary}{推论}
+\theoremstyle{definition}
+\newtheorem{definition}{定义}
+\theoremstyle{remark}
+\newtheorem{remark}{注记}
+
+% Convenience macros
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\ip}[2]{\left\langle #1,#2 \right\rangle}
+\newcommand{\supp}{\operatorname{supp}}
+\newcommand{\dist}{\operatorname{dist}}
+\newcommand{\argmin}{\operatorname*{arg\,min}}
+\newcommand{\softmin}{\operatorname{smin}}
+
+\title{面向接触仿真的分区 HRBF--PoU 隐式曲面重建\\
+\large ——基于拓扑邻接的局部 Soft-Min 尖锐特征平滑连接（初稿）}
+\author{（作者信息待补充）}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文提出一种面向接触仿真的全局隐式曲面构建方法：首先利用二面角阈值将三角网格切割为若干拓扑光滑区域（regions），在每个区域内部采用局部 Hermite RBF（HRBF）拟合并通过严格 $C^2$ 的分割统一（Partition of Unity, PoU）权重进行高阶连续拼接，得到每个区域的隐式场 $F_i(x)$。针对尖锐边/角点等非光滑特征，本文不采用全局混合，而是提出“拓扑邻接驱动”的局部 Soft-Min（log-sum-exp）连接机制：仅当查询点靠近\emph{主区域}的尖锐边界时，才将其拓扑相邻区域纳入候选集，并在一条可控宽度 $h$ 的管状邻域内实现平滑过渡。该设计在齿轮齿间狭缝等复杂构型中有效避免“空间近但拓扑不相邻”导致的错误融合（虚假桥接），同时可高效提供接触所需的嵌入深度与法向量（由 $\nabla F$ 给出）。文中给出完整的数学定义、光滑性与局部性条件、变量软化尺度 $\eps(x)$ 下的梯度闭式表达，以及数值稳定实现与加速策略。
+\end{abstract}
+
+\section{引言}
+在刚体/柔体接触仿真中，隐式表示（implicit surface）因其可直接提供接触深度与法向信息而具有优势。理想情况下，我们希望获得接近有符号距离场（Signed Distance Field, SDF）的隐式函数 $F(x)$，使得：
+\begin{itemize}[leftmargin=2em]
+\item 接触深度可近似为 $d(x)\approx F(x)/\norm{\nabla F(x)}$，或通过少量 Newton 迭代精化；
+\item 法向可由 $\bm n(x)=\nabla F(x)/\norm{\nabla F(x)}$ 稳定得到；
+\item 在几何光滑区域内具有高阶连续性（至少 $C^2$），以减少接触力抖动；
+\item 能处理包含尖锐边、角点的复杂 CAD/三角网格几何。
+\end{itemize}
+
+然而，尖锐特征与复杂构型（例如齿轮齿间狭缝）会带来两类典型困难：\textbf{(i)} 几何在尖锐边处法向不连续，若强行全局高阶光滑拟合会产生过度圆角；\textbf{(ii)} 在空间上相互接近但拓扑上不相邻的曲面片（例如狭缝两侧）会导致“包围域/支撑域重叠”，若以空间重叠为融合依据将出现错误桥接，从而破坏接触检测。
+本文方法的核心思想是：\emph{区域内高阶、区域间仅在拓扑允许的尖锐边界邻域内平滑连接}。这使得模型在大部分区域保持精确与稳定，在尖锐处引入可控的小尺度圆角，从而适用于高精度接触仿真。
+
+\section{问题设定与记号}
+给定定向三角网格 $\mathcal M=(V,\mathcal T)$，其中 $V=\{v_m\in\R^3\}$，$\mathcal T$ 为三角面集合。
+设网格几何曲面为 $\Sigma\subset\R^3$。
+
+\subsection{目标}
+构造全局隐式函数 $F:\R^3\to\R$，其零水平集
+\[
+\mathcal S=\{x\in\R^3\mid F(x)=0\}
+\]
+逼近 $\Sigma$。并支持接触查询：
+\[
+\bm n(x)=\frac{\nabla F(x)}{\norm{\nabla F(x)}},\qquad
+d(x)\approx \frac{F(x)}{\norm{\nabla F(x)}}.
+\]
+
+\subsection{几何查询与 SDF 约束（实现背景）}
+对于任意点 $x$，定义最近点映射
+\[
+c(x)=\argmin_{y\in\Sigma}\norm{x-y},\qquad d_0(x)=\norm{x-c(x)}.
+\]
+通过 AABB/BVH 可高效返回最近三角形 $t^*(x)\in\mathcal T$ 与最近点 $c(x)$。符号由伪法向（pseudo-normal）或绕数（winding number）给出 $s(x)\in\{-1,+1\}$，从而有符号距离（理想 SDF）
+\[
+\phi(x)=s(x)\,d_0(x).
+\]
+本文使用 $\phi(x)$ 作为拟合数据源（值约束）并可在曲面邻域用网格法向近似 $\nabla\phi$（导数约束）。
+
+\section{基于尖锐边的区域分解}
+\subsection{尖锐边检测}
+对共享边 $e$ 的相邻面 $t_a,t_b$，设其单位法向为 $n_a,n_b$，二面角
+\[
+\theta(e)=\arccos(n_a^\top n_b).
+\]
+给定阈值 $\theta_0$，定义尖锐边集合
+\[
+\Gamma=\{e\mid \theta(e)>\theta_0\}.
+\]
+
+\subsection{区域（regions）与尖锐边界}
+沿 $\Gamma$ 切割网格，在“非尖锐边连通”意义下得到面连通分量
+\[
+\mathcal T=\bigsqcup_{i=1}^{N} R_i,
+\]
+其中 $R_i$ 是第 $i$ 个光滑区域。
+
+\begin{definition}[区域尖锐边界与对侧映射]
+对每个区域 $R_i$，定义其\emph{尖锐边界集合}
+\[
+\Gamma_i:=\{e\in\Gamma\mid e\subset \partial R_i,\ \text{且跨过 }e\text{ 进入另一 }R_j\}.
+\]
+对每条 $e\in\Gamma_i$，定义对侧区域映射 $\mathrm{opp}(i,e)=j$。
+\end{definition}
+
+\begin{remark}
+后文用于尖锐处连接的候选集合必须由 $\Gamma_i$（而非空间包围域）触发。该设计是避免齿轮齿间狭缝等“空间近但拓扑不相邻”造成误融合的关键。
+\end{remark}
+
+\section{区域内 HRBF--PoU 隐式场构建}
+本节在每个区域内部构造一个高阶连续隐式场 $F_i(x)$。为了数学完备性与工程可控性，我们采用：（i）patch 覆盖 + 有限重叠；（ii）严格 $C^2$ 紧支撑权重形成 PoU；（iii）局部 HRBF（值 + 法向方向导数约束）拟合；（iv）patch 常数移位对齐减少漂移。
+
+\subsection{patch 覆盖与有限重叠公理}
+对每个区域 $i$，选取其重建域 $\Omega_i\subset\R^3$（开集，通常为区域曲面附近的管状邻域）。假设存在 patch 开覆盖 $\{\Omega^{\mathrm c}_{im}\}_{m=1}^{M_i}$ 满足：
+
+\textbf{公理 A2（覆盖与有限重叠）}
+\[
+\Omega_i\subset\bigcup_{m=1}^{M_i}\Omega^{\mathrm c}_{im},\qquad
+\#\{m:x\in\Omega^{\mathrm c}_{im}\}\le K,\ \forall x\in\Omega_i.
+\]
+并采用\emph{双半径}：权重半径 $\rho^{\mathrm w}_{im}$ 与覆盖半径 $\rho^{\mathrm c}_{im}>\rho^{\mathrm w}_{im}$。
+
+\subsection{椭球/OBB patch（推荐）}
+为抑制硬边两侧跨边混合，优先使用椭球 patch：
+\[
+q_{im}(x)=(x-\xi_{im})^\top Q_{im}(x-\xi_{im}),\qquad Q_{im}\succ0.
+\]
+定义覆盖域与权重支撑域：
+\[
+\Omega^{\mathrm c}_{im}=\{x:q_{im}(x)<(\rho^{\mathrm c}_{im})^2\},\qquad
+\Omega^{\mathrm w}_{im}=\{x:q_{im}(x)\le(\rho^{\mathrm w}_{im})^2\}\subset\Omega^{\mathrm c}_{im}.
+\]
+在薄壁/狭缝附近，可令 $Q_{im}$ 在法向方向更“薄”，以减少跨缝覆盖（仅用于加速/稳健性；理论正确性由后文拓扑候选集保证）。
+
+\subsection{严格 $C^2$ 紧支撑 bump 与 PoU 权重}
+定义 $C^2$ 紧支撑 bump：
+\[
+\rho(t)=
+\begin{cases}
+(1-t)^4(4t+1), & 0\le t<1,\\
+0, & t\ge 1.
+\end{cases}
+\]
+满足 $\rho\in C^2([0,\infty))$ 且 $\rho(1)=\rho'(1)=\rho''(1)=0$。
+
+定义未归一化权重：
+\[
+\tilde w_{im}(x)=\rho\!\left(\frac{q_{im}(x)}{(\rho^{\mathrm w}_{im})^2}\right)\ge 0,\qquad
+S_i(x)=\sum_{k=1}^{M_i}\tilde w_{ik}(x),
+\]
+并定义 PoU 权重：
+\[
+w_{im}(x)=\frac{\tilde w_{im}(x)}{S_i(x)}.
+\]
+
+\textbf{公理 A3-A（分母正下界）}\quad 存在常数 $c_w>0$ 使得
+\[
+S_i(x)\ge c_w,\qquad \forall x\in\Omega_i.
+\]
+工程上可通过加密 patch 中心、增大覆盖半径 $\rho^{\mathrm c}$ 或修补覆盖空洞保证该条件成立。
+
+\begin{lemma}[PoU 权重的 $C^2$ 性]
+若 $q_{im}$ 为多项式（或至少 $C^2$），$\rho\in C^2$ 且 (A3-A) 成立，则 $w_{im}\in C^2(\Omega_i)$ 且 $\sum_m w_{im}\equiv 1$。
+\end{lemma}
+
+\subsection{局部 HRBF：值 + 法向方向导数约束（标量形式）}
+硬边处法向不连续。因此每个 patch 仅从单一光滑区域 $R_i$ 内采样与拟合，避免跨硬边的矛盾导数约束。
+
+对 patch 内 $N$ 个约束点 $(x_j,n_j)$，令 $r_j(x)=\norm{x-x_j}$，选定标量径向核 $\phi(r)$，并引入一次多项式基
+\[
+p(x)=[1,x,y,z]^\top.
+\]
+
+采用“源点法向方向导数基”的 HRBF 表示：
+\[
+\boxed{
+s_{im}(x)=\sum_{j=1}^{N}\alpha_j\,\phi(r_j(x))
+-\sum_{j=1}^{N}\eta_j\big(n_j\cdot\nabla \phi(r_j(x))\big)
++c^\top p(x).
+}
+\]
+未知量为 $\alpha\in\R^N$、$\eta\in\R^N$、$c\in\R^4$。该形式等价于经典 HRBF 中将向量系数限制为 $\beta_j=\eta_j n_j$，从 $3N$ 降维到 $N$，更鲁棒且更易稳定。
+
+\paragraph{核导数闭式（$r>0$）}
+令 $u=(x-y)/r$，则
+\[
+\nabla_x\phi(r)=\phi'(r)\,u,
+\qquad
+H_x\phi(r)=\phi''(r)uu^\top+\frac{\phi'(r)}{r}(I-uu^\top).
+\]
+
+\paragraph{约束条件}
+给定值目标 $f_i$（通常靠近曲面取 $0$，或取采样 SDF 值），法向方向导数目标 $g_i$（可取 patch 尺度常数或来自 SDF 梯度），施加：
+\[
+s_{im}(x_i)=f_i,\qquad n_i\cdot\nabla s_{im}(x_i)=g_i.
+\]
+
+\paragraph{线性系统（对称块结构）}
+定义矩阵块（$i$ 为约束行，$j$ 为中心列）：
+\[
+\Phi_{ij}=\phi(\norm{x_i-x_j}),\quad
+G_{ij}=n_j\cdot\nabla\phi(\norm{x_i-x_j}),\quad
+D_{ij}=n_i\cdot\nabla\phi(\norm{x_i-x_j}),
+\]
+\[
+H_{ij}=n_i^\top H_x\phi(\norm{x_i-x_j})n_j.
+\]
+多项式块：
+\[
+P_{i,:}=p(x_i)^\top=[1,x_i,y_i,z_i],\qquad
+R_{i,:}=(n_i\cdot\nabla p(x_i))^\top=[0,n_{i,x},n_{i,y},n_{i,z}].
+\]
+则未知量 $y=[\alpha;\eta;c]$ 满足
+\[
+\boxed{
+\begin{bmatrix}
+\Phi & -G & P\\
+D & -H & R\\
+P^\top & R^\top & 0
+\end{bmatrix}
+\begin{bmatrix}
+\alpha\\ \eta\\ c
+\end{bmatrix}
+=
+\begin{bmatrix}
+f\\ g\\ 0
+\end{bmatrix}.
+}
+\]
+可在主块加 ridge 正则以抑制噪声与病态：
+\[
+\Phi\leftarrow \Phi+\lambda_\alpha I,\qquad H\leftarrow H+\lambda_\eta I.
+\]
+
+\subsection{patch 常数移位对齐}
+局部场在导数约束占主导时可能产生 patch 间常数漂移。采用常数移位：
+\[
+\mu_{im}=\frac{1}{n_{im}}\sum_{j=1}^{n_{im}} s_{im}(x_j^{(m)}),\qquad
+\tilde s_{im}(x)=s_{im}(x)-\mu_{im},
+\]
+以改善 overlap 区一致性。常数平移不改变光滑阶数。
+
+\subsection{区域隐式场 $F_i$ 的 PoU 拼接}
+定义
+\[
+\boxed{
+F_i(x)=\sum_{m=1}^{M_i} w_{im}(x)\,\tilde s_{im}(x),\qquad x\in\Omega_i.
+}
+\]
+由 $w_{im},\tilde s_{im}\in C^2$ 可得 $F_i\in C^2(\Omega_i)$。
+
+\section{区域有效域门控与惩罚延拓}
+为避免某区域在其可信域外参与竞争，构造 $C^2$ 门控 $\chi_i(x)\in[0,1]$，使得
+\[
+\chi_i(x)=1\ \text{于可信核心域}\ \Omega_i^{\text{core}},\qquad
+\chi_i(x)=0\ \text{于}\ \R^3\setminus \Omega_i.
+\]
+定义惩罚延拓：
+\[
+\boxed{
+\tilde F_i(x)=F_i(x)+\lambda(1-\chi_i(x)),
+}
+\]
+其中 $\lambda\gg 0$。其作用是：即便域外被纳入候选集，指数权重也会被强烈压制，从而不会产生“融合过深”。
+
+\section{全局隐式场：拓扑邻接驱动的局部 Soft-Min}
+本节给出全局隐式 $F(x)$ 的数学定义，并证明其可避免齿轮狭缝等复杂构型下的误融合。
+
+\subsection{主区域选择：由最近三角形确定}
+通过 BVH 得到最近三角形
+\[
+t^*(x)=\argmin_{t\in\mathcal T}\dist(x,t),
+\qquad
+i_0(x)=\mathrm{region}(t^*(x)).
+\]
+\begin{remark}
+当 $x$ 位于中轴（medial axis）上时最近三角形可能不唯一，该集合在 $\R^3$ 中为零测度。真实 SDF 在中轴处本就不可微，本文主要关注曲面邻域与接触查询区域，通常可忽略该集合，或采用固定 tie-break 规则定义 $i_0(x)$。
+\end{remark}
+
+\subsection{只允许“主区域尖锐边界”触发跨区连接}
+对主区域 $i_0$，考虑其尖锐边界集合 $\Gamma_{i_0}$。进一步将其按对侧区域分组：
+\[
+\Gamma_{i_0\to j}=\{e\in\Gamma_{i_0}\mid \mathrm{opp}(i_0,e)=j\}.
+\]
+定义到该边界组的距离
+\[
+\delta_{i_0\to j}(x)=\dist(x,\Gamma_{i_0\to j})=\min_{e\in\Gamma_{i_0\to j}}\dist(x,e).
+\]
+给定圆角带宽 $h>0$，定义边界门控
+\[
+\beta_{i_0\to j}(x)=\rho\!\left(\frac{\delta_{i_0\to j}(x)}{h}\right)\in[0,1].
+\]
+注意：当 $\delta\ge h$ 时 $\beta=0$ 且在 $\delta=h$ 处满足二阶导为 0 的平坦边界性质。
+
+\subsection{候选集合与“指数惩罚门控”}
+令主区域的拓扑相邻集合为
+\[
+\mathrm{Adj}(i_0)=\{j\mid \Gamma_{i_0\to j}\neq\emptyset\}.
+\]
+本文将候选集合固定为
+\[
+C(x)=\{i_0(x)\}\cup \mathrm{Adj}(i_0(x)),
+\]
+并通过能量惩罚确保\emph{仅在尖锐边邻域}相邻区域才起作用。
+
+定义候选能量：
+\[
+E_{i_0}(x)=\tilde F_{i_0}(x),
+\]
+\[
+E_j(x)=\tilde F_j(x)+\Lambda\big(1-\beta_{i_0\to j}(x)\big),\qquad j\in\mathrm{Adj}(i_0),
+\]
+其中 $\Lambda\gg 0$。当 $x$ 远离 $i_0$ 的边界组 $\Gamma_{i_0\to j}$ 时，$\beta=0$，于是 $E_j=\tilde F_j+\Lambda$，其在 soft-min 中的影响被指数级压制。
+
+\subsection{变量软化尺度 \texorpdfstring{$\eps(x)$}{eps(x)}}
+定义
+\[
+\beta_{\max}(x)=\max_{j\in \mathrm{Adj}(i_0(x))}\beta_{i_0(x)\to j}(x),
+\]
+\[
+\boxed{
+\eps(x)=\eps_{\mathrm{far}}+(\eps_{\mathrm{edge}}-\eps_{\mathrm{far}})\,\beta_{\max}(x),
+\qquad 0<\eps_{\mathrm{far}}\ll \eps_{\mathrm{edge}}\sim O(h).
+}
+\]
+
+\subsection{全局隐式函数定义（Soft-Min / log-sum-exp）}
+\[
+\boxed{
+F(x)= -\eps(x)\,\log\!\sum_{k\in C(x)}\exp\!\left(-\frac{E_k(x)}{\eps(x)}\right).
+}
+\]
+
+\begin{proposition}[区域内主控与指数抑制]
+若对所有 $j\in\mathrm{Adj}(i_0(x))$ 有 $\delta_{i_0\to j}(x)\ge h$，则 $\beta_{i_0\to j}(x)=0$，从而
+\[
+F(x)=\tilde F_{i_0}(x)-\eps(x)\log\!\left(1+\sum_{j\in\mathrm{Adj}(i_0)}\exp\!\left(-\frac{\tilde F_j(x)+\Lambda-\tilde F_{i_0}(x)}{\eps(x)}\right)\right).
+\]
+特别地，当 $\Lambda/\eps(x)\to\infty$ 时（或在工程上取足够大），有
+\[
+F(x)=\tilde F_{i_0}(x)+O\!\left(e^{-\Lambda/\eps(x)}\right),
+\]
+即主区域在边界邻域外严格主导，且相邻区域影响以指数速度消失。
+\end{proposition}
+
+\begin{proposition}[避免复杂构型误融合：以齿轮齿间狭缝为例]
+设 $x$ 位于齿间狭缝，使得 $x$ 同时落入多个区域的空间包围域/patch 支撑域内，但狭缝两侧曲面\emph{拓扑不相邻}（不共享尖锐边界）。则本文定义的候选集合 $C(x)$ 不会包含狭缝对侧的非邻接区域，因而不会产生“跨缝圆角桥接”。当 $x$ 在狭缝中轴附近发生最近三角形切换时，$i_0(x)$ 会切换，这对应真实距离场的最近面切换（几何事实），而不是错误融合。
+\end{proposition}
+
+\begin{remark}
+上述命题表明：包围域重叠只用于加速，不作为融合依据。真正决定融合的仅是“主区域尖锐边界邻域”（通过 $\Gamma_{i_0}$ 与 $\beta_{i_0\to j}$）。
+\end{remark}
+
+\section{梯度、法向与接触深度：完整闭式表达}
+\subsection{数值稳定的 log-sum-exp}
+当 $h$ 与 $\eps$ 极小（如 $10^{-7}\!\sim\!10^{-5}$）时，直接计算 $\exp(-E/\eps)$ 易下溢。设
+\[
+a_k(x)=-\frac{E_k(x)}{\eps(x)},\qquad a_{\max}(x)=\max_{k\in C(x)} a_k(x),
+\]
+则
+\[
+\log\sum_{k\in C}\exp(a_k)
+=
+a_{\max}+\log\sum_{k\in C}\exp(a_k-a_{\max}),
+\]
+可稳定计算 $F(x)$ 与 soft 权重。
+
+\subsection{soft 权重}
+定义
+\[
+\pi_k(x)=\frac{\exp\!\left(-E_k(x)/\eps(x)\right)}{\sum_{\ell\in C(x)}\exp\!\left(-E_\ell(x)/\eps(x)\right)},
+\qquad \sum_{k\in C}\pi_k=1.
+\]
+
+\subsection{变量 \texorpdfstring{$\eps(x)$}{eps(x)} 下的完整梯度}
+记
+\[
+Z(x)=\sum_{k\in C(x)}\exp\!\left(-\frac{E_k(x)}{\eps(x)}\right),\qquad
+F(x)=-\eps(x)\log Z(x).
+\]
+在 $i_0(x)$ 固定（远离中轴）且 $C(x)$ 固定的区域内，可得：
+
+\begin{theorem}[完整梯度公式（含 $\nabla\eps$ 项）]
+设所有 $E_k,\eps$ 在某开集内为 $C^1$ 且 $\eps>0$，则
+\[
+\boxed{
+\nabla F(x)=\sum_{k\in C(x)}\pi_k(x)\,\nabla E_k(x)
++\frac{\nabla\eps(x)}{\eps(x)}\left(\sum_{k\in C(x)}\pi_k(x)E_k(x)+F(x)\right).
+}
+\]
+\end{theorem}
+
+\paragraph{$\nabla E_k$ 的组成}
+主区域 $k=i_0$：
+\[
+\nabla E_{i_0}=\nabla \tilde F_{i_0}=\nabla F_{i_0}-\lambda\nabla\chi_{i_0}.
+\]
+相邻区域 $k=j$：
+\[
+\nabla E_j=\nabla \tilde F_j-\Lambda\nabla\beta_{i_0\to j}.
+\]
+其中
+\[
+\nabla F_i(x)=\sum_m\Big((\nabla w_{im})\,\tilde s_{im}+w_{im}\,\nabla\tilde s_{im}\Big),
+\]
+且
+\[
+\nabla w_{im}=\frac{\nabla \tilde w_{im}}{S_i}-\frac{\tilde w_{im}}{S_i^2}\nabla S_i,\qquad
+\nabla S_i=\sum_k \nabla\tilde w_{ik}.
+\]
+
+\subsection{法向与深度}
+法向：
+\[
+\bm n(x)=\frac{\nabla F(x)}{\norm{\nabla F(x)}}.
+\]
+一阶深度近似：
+\[
+d(x)\approx \frac{F(x)}{\norm{\nabla F(x)}}.
+\]
+为获得更高精度，可做 1--2 次 Newton 投影到零水平集：
+\[
+x_{t+1}=x_t-\frac{F(x_t)}{\norm{\nabla F(x_t)}^2}\nabla F(x_t).
+\]
+
+\section{算法流程与复杂度}
+\subsection{预处理与查询伪代码}
+\begin{algorithm}[h]
+\caption{预处理：分区 HRBF--PoU 与拓扑邻接结构}
+\begin{algorithmic}[1]
+\State 输入网格 $\mathcal M=(V,\mathcal T)$，阈值 $\theta_0$，参数 $h,\eps_{\mathrm{far}},\eps_{\mathrm{edge}},\lambda,\Lambda$
+\State 计算二面角，得尖锐边 $\Gamma$
+\State 沿 $\Gamma$ 切割面集，得 regions $\{R_i\}$
+\State 构造每个 region 的尖锐边界集合 $\Gamma_i$ 与对侧映射 $\mathrm{opp}(i,e)$
+\State 构造 mesh BVH（最近三角形/最近点），以及每个 $\Gamma_i$ 的边界距离查询结构（edge BVH）
+\For{每个 region $i$}
+  \State 设计重建域 $\Omega_i$ 与 patch 覆盖 $\{\Omega^{\mathrm c}_{im}\}$（满足 A2）
+  \State 在每个 patch 内采样约束点与法向（不跨硬边）
+  \State 解局部 HRBF 得 $s_{im}$，做常数移位得 $\tilde s_{im}$
+  \State 构造 $C^2$ 权重 $w_{im}$（满足 A3-A），得 $F_i=\sum_m w_{im}\tilde s_{im}$
+  \State 构造门控 $\chi_i$ 并实现惩罚延拓 $\tilde F_i$
+\EndFor
+\State 输出：$\{F_i,\tilde F_i\}$、BVH、$\{\Gamma_i,\mathrm{opp}\}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[h]
+\caption{查询：全局隐式 $F(x)$ 与法向/深度}
+\begin{algorithmic}[1]
+\State 输入点 $x$
+\State 通过 mesh BVH 得最近三角形 $t^*(x)$ 与主区域 $i_0$
+\State 对 $j\in \mathrm{Adj}(i_0)$ 计算 $\delta_{i_0\to j}(x)$，并得 $\beta_{i_0\to j}(x)$
+\State 计算 $\eps(x)=\eps_{\mathrm{far}}+(\eps_{\mathrm{edge}}-\eps_{\mathrm{far}})\max_j\beta_{i_0\to j}(x)$
+\State 计算候选能量 $E_{i_0}$ 与 $E_j=\tilde F_j+\Lambda(1-\beta_{i_0\to j})$
+\State 用稳定 log-sum-exp 计算 $F(x)$ 与 $\pi_k(x)$
+\State 由完整梯度公式计算 $\nabla F(x)$，输出 $\bm n=\nabla F/\norm{\nabla F}$，深度 $d\approx F/\norm{\nabla F}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{复杂度讨论}
+\begin{itemize}[leftmargin=2em]
+\item mesh BVH 最近三角形查询：$O(\log|\mathcal T|)$；
+\item 边界距离查询：对固定主区域 $i_0$，只需查询 $\Gamma_{i_0}$（或其分组 BVH），复杂度 $O(\log|\Gamma_{i_0}|)$；
+\item region 内 $F_i$ 评估：通过 patch 索引取 Top-$K$ patch，仅需 $O(K)$ 次 HRBF/权重评估；
+\item soft-min 仅在主区域邻接集合上进行，通常候选数很小（CAD 模型常为 2，角点为 3--6）。
+\end{itemize}
+
+\section{讨论与局限}
+\begin{itemize}[leftmargin=2em]
+\item \textbf{中轴处不可微性：} 最近三角形切换对应真实距离场的不可微集合（中轴），这并非算法缺陷。接触仿真通常在曲面附近工作且可 warm-start，影响可控。
+\item \textbf{参数选择：} $h$ 决定圆角带宽（你可设 $10^{-7}\sim10^{-5}$），$\eps_{\mathrm{edge}}\sim O(h)$，$\eps_{\mathrm{far}}\ll \eps_{\mathrm{edge}}$；$\Lambda$ 需满足 $\Lambda/\eps_{\mathrm{far}}\gg 1$ 以保证指数抑制；$\lambda$ 由域外可信度决定。
+\item \textbf{采样策略：} 靠近硬边处可降低导数约束强度或仅施加值约束，以避免硬边附近的法向估计噪声对拟合造成放大。
+\end{itemize}
+
+\section{结论与后续工作}
+本文给出一种面向接触仿真的分区隐式曲面重建框架：区域内 HRBF--PoU 提供高阶连续与高精度拟合；区域间采用拓扑邻接驱动的局部 soft-min，仅在尖锐边界邻域进行平滑连接，并通过指数惩罚门控保证在复杂构型（如齿轮狭缝）中不发生错误融合。后续工作包括：更系统的参数自适应（按局部曲率与接触尺度设置 $h,\eps$）、在动态仿真中的 warm-start/缓存策略，以及在非闭合网格与多材料接触下的拓展。
+
+\appendix
+\section{附录：完整梯度推导（简要）}
+令 $F=-\eps\log Z$，$Z=\sum_k \exp(-E_k/\eps)$。则
+\[
+\nabla F=-(\nabla\eps)\log Z-\eps\nabla(\log Z),\qquad
+\nabla(\log Z)=\sum_k \pi_k \nabla\left(-\frac{E_k}{\eps}\right).
+\]
+且
+\[
+\nabla\left(-\frac{E_k}{\eps}\right)=-\frac{\nabla E_k}{\eps}+\frac{E_k}{\eps^2}\nabla\eps.
+\]
+代入并整理即得正文定理中的闭式表达：
+\[
+\nabla F=\sum_k\pi_k\nabla E_k+\frac{\nabla\eps}{\eps}\left(\sum_k\pi_k E_k+F\right).
+\]
+
+\end{document}
