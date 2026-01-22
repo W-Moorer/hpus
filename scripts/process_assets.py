@@ -92,8 +92,16 @@ def plot_4view(mesh, output_path):
     plt.close()
 
 def main():
+    parser = argparse.ArgumentParser(description="Reconstruct and visualize global model.")
+    parser.add_argument("--asset_name", type=str, default="Cylinder", help="Asset name")
+    parser.add_argument("--device", type=str, default="cpu", help="Device (cpu, cuda)")
+    parser.add_argument("--max_trusted_dist", type=float, default=0.2, help="Absolute distance cutoff")
+    args = parser.parse_args()
+    
+    # ...
+    
     asset_dir = os.path.join(os.path.dirname(__file__), '../assets/nonsmooth_geometry')
-    asset_name = "Cylinder"
+    asset_name = args.asset_name
     
     print(f"[Process] Loading {asset_name} from {asset_dir}...")
     mesh = load_custom_mesh(asset_dir, asset_name)
@@ -109,16 +117,17 @@ def main():
     print("[Process] Reconstructing Regions...")
     for rid in topo_data['regions']:
         submesh = preprocessor.get_region_mesh(rid)
-        recon = RegionReconstructor(rid, submesh, device='cpu') # Use CPU for safety
+        recon = RegionReconstructor(rid, submesh, device=args.device) 
         recon.setup_patches()
         recon.fit()
         regions.append(recon)
         
     global_model = GlobalImplicitSurface(regions, topo_manager, 
-                                         device='cpu',
-                                         epsilon_far=1e-3, # Tuned for CAD scale ~1.0
+                                         device=args.device,
+                                         epsilon_far=1e-3, 
                                          epsilon_edge=0.02, 
-                                         h_bandwidth=0.05)
+                                         h_bandwidth=0.05,
+                                         max_trusted_dist=args.max_trusted_dist)
                                          
     # Set Times New Roman font
     plt.rcParams["font.family"] = "serif"
@@ -132,10 +141,6 @@ def main():
     output_dir = os.path.join(os.path.dirname(__file__), '../output/ply')
     os.makedirs(output_dir, exist_ok=True)
     
-    output_ply = os.path.join(output_dir, f"{asset_name}_reconstructed.ply")
-    
-    # If the user wants to always overwrite, we remove the skip logic.
-    # We can still keep the output path definition.
     output_ply = os.path.join(output_dir, f"{asset_name}_reconstructed.ply")
 
     print("[Process] Extracting Iso-surface...")

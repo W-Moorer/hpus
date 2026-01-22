@@ -20,7 +20,8 @@ class GlobalImplicitSurface:
                  epsilon_edge: float = 1e-2,
                  h_bandwidth: float = 1e-2,
                  lambda_gate: float = 100.0, # Lambda in PDF (for soft-min gating)
-                 device: str = 'cpu'):
+         device: str = 'cpu',
+                 max_trusted_dist: float = 0.2):
         
         self.regions = regions
         self.topology = topology
@@ -34,6 +35,7 @@ class GlobalImplicitSurface:
         self.eps_edge = epsilon_edge
         self.h = h_bandwidth
         self.Lambda = lambda_gate
+        self.max_trusted_dist = max_trusted_dist
 
     def evaluate(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -174,6 +176,18 @@ class GlobalImplicitSurface:
             sum_exp = np.sum(exp_term, axis=0)
             
             F_group = -eps_x * np.log(np.maximum(sum_exp, 1e-12)) + E_min
+            
+            # --- Absolute Distance Cutoff ---
+            # If point is too far accurately trust the HRBF, force it to positive distance.
+            # This removes ghosting in the void.
+            # We use a smooth transition or hard cutoff?
+            # Hard cutoff:
+            mask_far = global_min_dist > self.max_trusted_dist
+            if np.any(mask_far):
+                 # Force to signed distance approximation (which is just distance since we are outside)
+                 # We prefer +dist to ensure it's > 0
+                 F_group[mask_far] = global_min_dist[mask_far]
+            
             F_global[mask] = F_group
             
         return F_global

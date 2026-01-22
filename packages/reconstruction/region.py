@@ -160,7 +160,23 @@ class RegionReconstructor:
             print(f"[Region {self.region_id}] Single patch setup.")
 
         # Store anchors for gating
-        self.anchors = vertices
+        # Augment vertices with sampled points to ensure dense coverage for distance query
+        # Target density: at least 1 point per unit area? 
+        # Or simpler: Ensure some minimum number of anchors relative to area.
+        
+        # Determine number of samples
+        # Heuristic: 10 * num_vertices or based on area
+        target_num = max(1000, len(vertices) * 5)
+        if len(vertices) < target_num:
+             try:
+                 samples, _ = trimesh.sample.sample_surface(self.mesh, target_num)
+                 self.anchors = np.vstack([vertices, samples])
+             except Exception:
+                 # Fallback if sampling fails (e.g. degenerate mesh)
+                 self.anchors = vertices
+        else:
+             self.anchors = vertices
+             
         self.anchor_tree = cKDTree(self.anchors)
 
     def fit(self, global_sdf_fn=None):
@@ -270,7 +286,9 @@ class RegionReconstructor:
         """
         Compute minimum distance to region anchors.
         """
-        dists, _ = self.anchor_tree.query(points, k=1)
+        if len(points) == 0:
+            return np.array([])
+        _, dists, _ = self.mesh.nearest.on_surface(points)
         return dists
 
 
