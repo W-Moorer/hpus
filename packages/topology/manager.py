@@ -141,6 +141,8 @@ class TopologyManager:
         # print(f"[TopologyManager] Indexed {count} boundary edges.")
 
 
+        self.gpu_segments_cache = {} # Cache for GPU tensors (device_str -> {key -> (A, B)})
+
     def get_closest_region(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Find the closest region for each point.
@@ -149,6 +151,10 @@ class TopologyManager:
             closest_points: (N, 3)
             region_ids: (N,)
         """
+        # Warning: This calls trimesh CPU search. 
+        # If GPU optimizations are enabled, caller should implement alternative logic
+        # or we should update this to use GPU meshes if available.
+        # For now, leaving as baseline.
         closest_points, distances, triangle_ids = self.mesh.nearest.on_surface(points)
         region_ids = self.face_region_map[triangle_ids]
         return distances, closest_points, region_ids
@@ -167,21 +173,41 @@ class TopologyManager:
         # Get segments: (K, 2, 3)
         segments = self.edge_segments[edge_indices] # K segments
         
-        # Vectorized point-segment distance
-        # Points: (N, 3) -> (N, 1, 3)
-        # Segments: (K, 2, 3) -> A=(K, 3), B=(K, 3)
-        
         A = segments[:, 0, :]
         B = segments[:, 1, :]
         
-        # This can be heavy if N*K is large.
-        # If N is large, loop over points? Or chunks?
-        # If K is large (many boundary edges), usage of BVH is preferred.
-        
-        # For prototype, we do brute force broadcast.
-        # But watch out for memory: N=10000, K=1000 => 10^7 floats => 40MB. OK.
-        
         return self._point_segment_distance_batch(points, A, B)
+        
+    def get_boundary_distance_gpu(self, region_id: int, neighbor_id: int, points_gpu: object, device: str) -> object:
+        """
+        GPU version of boundary distance.
+        points_gpu: (N, 3) torch tensor
+        """
+        if neighbor_id not in self._boundary_groups.get(region_id, {}):
+            return torch.full((len(points_gpu),), float('inf'), device=device)
+            
+        edge_indices = self._boundary_groups[region_id][neighbor_id]
+        if not edge_indices:
+            return torch.full((len(points_gpu),), float('inf'), device=device)
+        
+        key = (region_id, neighbor_id)
+        
+        # Check cache
+        if device not in self.gpu_segments_cache:
+            self.gpu_segments_cache[device] = {}
+            
+        if key not in self.gpu_segments_cache[device]:
+            # Upload
+            segments_cpu = self.edge_segments[edge_indices] # (K, 2, 3)
+            import torch
+            A = torch.tensor(segments_cpu[:, 0, :], dtype=torch.float32, device=device)
+            B = torch.tensor(segments_cpu[:, 1, :], dtype=torch.float32, device=device)
+            self.gpu_segments_cache[device][key] = (A, B)
+            
+        A, B = self.gpu_segments_cache[device][key]
+        
+        from ..reconstruction.geometry_gpu import point_segment_distance
+        return point_segment_distance(points_gpu, A, B)
 
     def _point_segment_distance_batch(self, P, A, B):
         """

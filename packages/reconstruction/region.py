@@ -156,28 +156,16 @@ class RegionReconstructor:
             # If vertices are essentially a point
             if bbox_diag < 1e-6: bbox_diag = 1.0
             
-            self.patch_radii = np.array([bbox_diag * 0.8]) # 0.8 covers center to corner approx
-            print(f"[Region {self.region_id}] Single patch setup.")
-
-        # Store anchors for gating
-        # Augment vertices with sampled points to ensure dense coverage for distance query
-        # Target density: at least 1 point per unit area? 
-        # Or simpler: Ensure some minimum number of anchors relative to area.
-        
-        # Determine number of samples
-        # Heuristic: 10 * num_vertices or based on area
-        target_num = max(1000, len(vertices) * 5)
-        if len(vertices) < target_num:
-             try:
-                 samples, _ = trimesh.sample.sample_surface(self.mesh, target_num)
-                 self.anchors = np.vstack([vertices, samples])
-             except Exception:
-                 # Fallback if sampling fails (e.g. degenerate mesh)
-                 self.anchors = vertices
+        if len(self.mesh.vertices) > 0:
+             # Pre-load triangles to GPU for fast distance query
+             # mesh.faces: (F, 3) indices
+             # mesh.vertices: (V, 3) floats
+             # triangles: (F, 3, 3)
+             faces = torch.tensor(self.mesh.faces, dtype=torch.long, device=self.device)
+             verts = torch.tensor(self.mesh.vertices, dtype=torch.float32, device=self.device)
+             self.triangles_gpu = verts[faces] # (F, 3, 3)
         else:
-             self.anchors = vertices
-             
-        self.anchor_tree = cKDTree(self.anchors)
+             self.triangles_gpu = torch.empty((0, 3, 3), device=self.device)
 
     def fit(self, global_sdf_fn=None):
         """
@@ -259,7 +247,9 @@ class RegionReconstructor:
         - 1.0 if dist < margin
         - Decays to 0.0 otherwise.
         """
-        _, dists, _ = self.mesh.nearest.on_surface(points)
+        # We need distance here too.
+        # Use our new GPU distance
+        dists = self.compute_dist_to_region(points)
         
         # Gating bandwidth
         sigma = self.avg_spacing * 5.0 # Falloff width
@@ -277,6 +267,10 @@ class RegionReconstructor:
         Returns tilde_F_i(x) = F_i(x) + lambda * (1 - chi_i(x))
         """
         f_i = self.evaluate(points)
+        
+        # Re-use compute_gating which effectively calls distance again?
+        # Ideally cached, but points change per batch.
+        # GPU distance is fast enough.
         chi_i = self.compute_gating(points)
         
         # If lambda is large, this drives value huge outside region.
@@ -284,11 +278,37 @@ class RegionReconstructor:
 
     def compute_dist_to_region(self, points: np.ndarray) -> np.ndarray:
         """
-        Compute minimum distance to region anchors.
+        Compute minimum distance to region mesh using GPU.
         """
         if len(points) == 0:
             return np.array([])
-        _, dists, _ = self.mesh.nearest.on_surface(points)
-        return dists
+            
+        # 1. To GPU
+        import torch
+        pts_gpu = torch.tensor(points, dtype=torch.float32, device=self.device)
+        
+        # 2. Compute Distance with Chunking to avoid OOM
+        # 540 faces * 10000 points = 5.4M pairs. 
+        # With intermediates, 10k points is fine. 100k might utilize ~5-10GB VRAM.
+        # Let's be safe with 10k chunks.
+        chunk_size = 10000
+        M = len(points)
+        dists_gpu = torch.empty(M, dtype=torch.float32, device=self.device)
+        
+        from .geometry_gpu import point_triangle_distance
+        
+        if self.triangles_gpu.shape[0] == 0:
+             return np.full(len(points), 1e6)
+             
+        for i in range(0, M, chunk_size):
+            end = min(i + chunk_size, M)
+            batch_pts = pts_gpu[i:end]
+            
+            # (B,) tensor
+            batch_dists = point_triangle_distance(batch_pts, self.triangles_gpu)
+            dists_gpu[i:end] = batch_dists
+            
+        # 3. Back to CPU
+        return dists_gpu.cpu().numpy()
 
 
