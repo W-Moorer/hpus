@@ -1,9 +1,11 @@
 
 import sys
 import os
+import matplotlib
+matplotlib.use('Agg') # Use non-interactive backend
+import matplotlib.pyplot as plt
 import trimesh
 import numpy as np
-import matplotlib.pyplot as plt
 import argparse
 
 # Add project root

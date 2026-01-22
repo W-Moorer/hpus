@@ -22,14 +22,14 @@ class NormalDirectionalSolverGPU:
     使用 PyTorch 实现向量化批量评估。
     """
     
-    def __init__(self, kernel_type: str = 'phs', k: int = 5, 
+    def __init__(self, kernel_type: str = 'phs', k: int = 3, 
                  device: str = 'cuda'):
         """
         初始化 GPU 求解器
         
         参数:
             kernel_type: 核函数类型
-            k: PHS 多项式次数
+            k: PHS 多项式次数 (Default 3 for Linear polynomial compatibility)
             device: 计算设备 ('cuda' 或 'cpu')
         """
         if not HAS_TORCH:
@@ -209,7 +209,7 @@ class NormalDirectionalSolverGPU:
 def batch_evaluate_all_solvers(query_points: np.ndarray, 
                                solvers: list,
                                patch_centers: np.ndarray,
-                               patch_radius: float,
+                               patch_radius: object,
                                device: str = 'cuda',
                                use_linear_blend: bool = True,
                                tau: float = 0.01,
@@ -221,7 +221,7 @@ def batch_evaluate_all_solvers(query_points: np.ndarray,
         query_points: 查询点 (M x 3)
         solvers: NormalDirectionalSolverGPU 列表
         patch_centers: patch 中心 (P x 3)
-        patch_radius: patch 半径
+        patch_radius: patch 半径 (float 或 np.ndarray (P,))
         device: 计算设备
         use_linear_blend: True=线性融合, False=NG-RBlend非线性融合
         tau: NG-RBlend 温度参数（越小越接近 min/max）
@@ -241,11 +241,21 @@ def batch_evaluate_all_solvers(query_points: np.ndarray,
     x = torch.tensor(query_points, dtype=torch.float32, device=dev)  # (M, 3)
     centers = torch.tensor(patch_centers, dtype=torch.float32, device=dev)  # (P, 3)
     
+    if isinstance(patch_radius, (float, int)):
+        radii = torch.tensor(float(patch_radius), dtype=torch.float32, device=dev)
+    else:
+        radii = torch.tensor(patch_radius, dtype=torch.float32, device=dev)
+        # Ensure shape (P,)
+        if radii.dim() == 1 and radii.shape[0] != P:
+             # Try to fix or warn? 
+             pass
+    
     # 计算距离平方
     dist_sq = torch.sum((x[:, None, :] - centers[None, :, :]) ** 2, dim=2)  # (M, P)
     
     # C2 Bump 权重
-    t = dist_sq / (patch_radius ** 2)
+    # radii can be scalar or (P,) which broadcasts to (M, P)
+    t = dist_sq / (radii ** 2)
     weights = torch.where(
         t < 1.0,
         torch.pow(1 - t, 4) * (4 * t + 1),
@@ -348,9 +358,46 @@ def batch_evaluate_all_solvers(query_points: np.ndarray,
         # 混合 soft-min 和 soft-max
         field_values = gamma * s_max + (1 - gamma) * s_min
     
-    # 处理无覆盖区域
+    # 处理无覆盖区域 (盲区外推)
     no_coverage = weight_sum < 1e-10
-    field_values[no_coverage] = 1.0  # 外部默认值
-    
+    if torch.any(no_coverage):
+        # 找到最近的 patch 索引
+        _, nearest_p_idxs = torch.min(dist_sq[no_coverage], dim=1)
+        nc_indices = torch.where(no_coverage)[0]
+        
+        # 批量处理同属一个 nearest patch 的查询点以提高效率
+        unique_p_idxs = torch.unique(nearest_p_idxs)
+        for p_idx in unique_p_idxs:
+            p_val = p_idx.item()
+            solver = solvers[p_val]
+            if solver is None:
+                continue
+            
+            # 属于这个 patch 的盲区点
+            mask_in_nc = (nearest_p_idxs == p_val)
+            global_nc_indices = nc_indices[mask_in_nc]
+            
+            pts_nc = x[global_nc_indices]
+            
+            # 计算 HRBF 值
+            diff = pts_nc[:, None, :] - solver.constraint_points[None, :, :]
+            r = torch.norm(diff, dim=2)
+            phi_vals = solver.phi(r)
+            term1 = torch.sum(phi_vals * solver.alpha[None, :], dim=1)
+            
+            r_safe = torch.clamp(r, min=1e-10)
+            c1 = solver.d1(r) / r_safe
+            c1 = torch.where(r > 1e-10, c1, torch.zeros_like(c1))
+            grad_dot_n = torch.sum(diff * solver.constraint_normals[None, :, :], dim=2)
+            grad_dot_n = c1 * grad_dot_n
+            term2 = torch.sum(grad_dot_n * solver.eta[None, :], dim=1)
+            
+            ones = torch.ones(len(pts_nc), 1, device=dev)
+            p_poly = torch.cat([ones, pts_nc], dim=1)
+            term3 = torch.sum(p_poly * solver.c[None, :], dim=1)
+            
+            vals = term1 - term2 + term3 - solver.shift
+            field_values[global_nc_indices] = vals
+
     return field_values.cpu().numpy()
 

@@ -114,33 +114,66 @@ class GlobalImplicitSurface:
                 vals_candidates.append(val_j_gated)
                 cand_indices.append(n_id)
             
-            # 3. Soft-Min
+            # 3. Jurisdiction Gating (Relative Distance-based)
+            # Find distances to all candidate regions
+            all_cands = [r_id] + neighbors
+            M = len(pts_sub)
+            K_c = len(all_cands)
+            cand_dists = np.zeros((M, K_c))
+            
+            for i, c_id in enumerate(all_cands):
+                cand_dists[:, i] = self.region_map[c_id].compute_dist_to_region(pts_sub)
+            
+            # Global min dist at each point among candidates
+            global_min_dist = np.min(cand_dists, axis=1)
+            
+            # Jurisdicton bandwidth (buffer zone)
+            # delta_jur = max(2.0 * self.h, 0.15) 
+            # Use h as reference
+            delta_jur = self.h * 2.0
+            
+            # 4. Soft-Min with Jurisdiction Gating
             # epsilon(x) = eps_far + (eps_edge - eps_far) * beta_max
             eps_x = self.eps_far + (self.eps_edge - self.eps_far) * betas_max
             
-            # Stack candidates: (K, M) where K = 1 + num_neighbors
-            E_stack = np.stack(vals_candidates, axis=0) # (K, M)
+            # Final energies incorporating both topology gating (beta) and jurisdiction gating
+            E_final_list = []
             
-            # F = -eps * log sum exp (-E / eps)
-            # Numerical stability: shift by min
-            # exp(-E/eps) = exp(-(E - E_min)/eps - E_min/eps)
-            #             = exp(-(E-E_min)/eps) * exp(-E_min/eps)
+            # Primary region (index 0 in all_cands)
+            dist_diff_0 = np.clip(cand_dists[:, 0] - global_min_dist, 0, None)
+            u_jur_0 = np.clip(dist_diff_0 / delta_jur, 0, 1)
+            w_jur_0 = 1.0 - (6 * u_jur_0**5 - 15 * u_jur_0**4 + 10 * u_jur_0**3) # C2 step
             
+            # Penalty = Lambda * (1 - w_jur)
+            # This ensures even the primary region is suppressed if it's far from its own anchors
+            # (though primary usually is the closest)
+            E_final_list.append(val_i0 + self.Lambda * (1.0 - w_jur_0))
+            
+            # Neighbors
+            for i, n_id in enumerate(neighbors):
+                # idx in cand_dists is i+1
+                dist_diff_n = np.clip(cand_dists[:, i+1] - global_min_dist, 0, None)
+                u_jur_n = np.clip(dist_diff_n / delta_jur, 0, 1)
+                w_jur_n = 1.0 - (6 * u_jur_n**5 - 15 * u_jur_n**4 + 10 * u_jur_n**3)
+                
+                # neighbor energy Ej = val_j_gated + Lambda * (1 - w_jur)
+                # val_j_gated already has hierarchy penalty Lambda(1-beta)
+                Ej_final = vals_candidates[i+1] + self.Lambda * (1.0 - w_jur_n)
+                E_final_list.append(Ej_final)
+            
+            # Stack final candidates: (K, M)
+            E_stack = np.stack(E_final_list, axis=0)
+            
+            # Log-Sum-Exp for Soft-Min
             E_min = np.min(E_stack, axis=0)
             E_shifted = E_stack - E_min[np.newaxis, :]
-            
-            # -E/eps
-            # careful with eps (M,) broadcasting
             eps_expanded = eps_x[np.newaxis, :]
             
-            arg = -E_shifted / eps_expanded
+            arg = -E_shifted / np.maximum(eps_expanded, 1e-12)
             exp_term = np.exp(arg)
             sum_exp = np.sum(exp_term, axis=0)
             
-            # F = -eps * ( log(sum_exp) - E_min/eps )
-            #   = -eps * log(sum_exp) + E_min
-            
-            F_group = -eps_x * np.log(sum_exp) + E_min
+            F_group = -eps_x * np.log(np.maximum(sum_exp, 1e-12)) + E_min
             F_global[mask] = F_group
             
         return F_global

@@ -3,8 +3,10 @@ import numpy as np
 import trimesh
 import torch
 from typing import Tuple, Optional, List
+from scipy.spatial import cKDTree
 from .solver import NormalDirectionalSolverGPU
 from .pou import C2Bump, compute_weights_batch
+from .sampling import poisson_disk_sampling
 
 class RegionReconstructor:
     """
@@ -19,7 +21,8 @@ class RegionReconstructor:
     def __init__(self, region_id: int, mesh: trimesh.Trimesh, 
                  device: str = 'cuda',
                  patch_radius_ratio: float = 3.0,
-                 lambda_penalty: float = 10.0):
+                 lambda_penalty: float = 10.0,
+                 gating_margin_ratio: float = 1.0):
         """
         Args:
             region_id: Unique ID of the region.
@@ -27,6 +30,7 @@ class RegionReconstructor:
             device: 'cuda' or 'cpu'.
             patch_radius_ratio: Ratio of patch radius to average point spacing.
             lambda_penalty: Penalty strength for points outside validity domain.
+            gating_margin_ratio: Ratio of spacing to extend validity domain (Plateau).
         """
         self.region_id = region_id
         self.mesh = mesh
@@ -38,8 +42,13 @@ class RegionReconstructor:
         self.patch_radii: np.ndarray = None
         self.solvers: List[NormalDirectionalSolverGPU] = []
         
+        # Anchors for Jurisdiction Gating
+        self.anchors: np.ndarray = None
+        self.anchor_tree: cKDTree = None
+        
         # Fitting parameters
         self.patch_radius_ratio = patch_radius_ratio
+        self.gating_margin_ratio = gating_margin_ratio
         
         # Estimate average spacing for radius
         # Approximate by sqrt(area / N)
@@ -52,26 +61,107 @@ class RegionReconstructor:
 
     def setup_patches(self, num_patches: int = -1):
         """
-        Generate patch centers and radii.
-        If num_patches is -1, heuristic is used.
+        Generate patch centers using Poisson Disk Sampling and adaptive radii.
         """
+        vertices = np.ascontiguousarray(self.mesh.vertices)
+        
+        # 1. Determine number of patches
         if num_patches <= 0:
-            # Heuristic: 1 patch per 5-10 vertices? Or Poisson Disk?
-            # Let's verify sample_surface.
-            # For accurate reconstruction, we want patches to overlap.
-            num_patches = max(10, len(self.mesh.vertices) // 5)
+            # Heuristic: 1 patch per 10 vertices (patch_divisor = 10.0)
+            # Ensure at least 1 patch
+            num_patches = max(1, int(len(vertices) / 10.0))
         
-        # Sample points on surface for patch centers
-        self.patch_centers, _ = trimesh.sample.sample_surface(self.mesh, num_patches)
+        # 2. Sample patch centers (Poisson Disk)
+        # Note: self.mesh.vertices might be sparse or dense. 
+        # If mesh is very low poly, we might need to sample on surface first to get enough candidates.
+        # But here we assume vertices are dense enough or we just use vertices.
+        # For better quality, let's sample points on surface first if vertices are few?
+        # Actually, poisson_disk_sampling takes points. 
+        # Let's pass mesh vertices directly for now.
+        self.patch_centers = poisson_disk_sampling(vertices, num_patches)
         
-        # Determine radius: k-NN distance or fixed ratio
-        # Simple fixed ratio based on density
-        # Volume / patches approx?
-        # Let's use avg spacing.
-        radius = self.avg_spacing * self.patch_radius_ratio
-        self.patch_radii = np.full(len(self.patch_centers), radius)
-        
-        print(f"[Region {self.region_id}] Setup {len(self.patch_centers)} patches, Radius={radius:.4f}")
+        # 3. Adaptive Radius Strategy
+        num_p = len(self.patch_centers)
+        if num_p < 1:
+             # Fallback if sampling failed completely (unlikely)
+             self.patch_centers = np.mean(vertices, axis=0, keepdims=True)
+             num_p = 1
+
+        if num_p >= 2:
+            # --- Phase 1: Initial Radius (k-NN based) ---
+            tree_p = cKDTree(self.patch_centers)
+            # Query 2 nearest neighbors (1st is self, 2nd is closest other)
+            dists_p, _ = tree_p.query(self.patch_centers, k=2)
+            # Use max of nearest neighbor distances as baseline scale
+            tau_val = np.max(dists_p[:, 1])
+            
+            # Initial radius: slightly larger than spacing to ensure overlap
+            # (1.0 + 1.0) * tau / 2.0  -> effectively tau
+            initial_rho = tau_val
+            self.patch_radii = np.full(num_p, initial_rho)
+            
+            # --- Phase 2: Density Adjustment ---
+            # Ensure each patch covers at least n_min vertices
+            n_min = 10
+            tree_v = cKDTree(vertices)
+            
+            # Batch query might be memory heavy if num_p is huge, loop is safer
+            for m in range(num_p):
+                # Check count in current radius
+                # query_ball_point is fast
+                indices = tree_v.query_ball_point(self.patch_centers[m], self.patch_radii[m])
+                count = len(indices)
+                
+                if count < n_min:
+                    # Expand to include n_min-th neighbor
+                    # k = min(len(vertices), n_min)
+                    k_query = min(len(vertices), n_min)
+                    dists_v, _ = tree_v.query(self.patch_centers[m], k=k_query)
+                    
+                    # New radius = dist to k-th neighbor * margin
+                    # dists_v can be array if k>1
+                    if isinstance(dists_v, np.ndarray):
+                        new_r = dists_v[-1] * 1.05
+                    else:
+                        new_r = dists_v * 1.05
+                        
+                    self.patch_radii[m] = max(self.patch_radii[m], new_r)
+            
+            # --- Phase 3: Global Coverage Adjustment ---
+            # Ensure every vertex is covered by at least one patch
+            # Query nearest patch for each vertex
+            # tree_p is already built
+            v_dists, v_indices = tree_p.query(vertices, k=1)
+            
+            expanded_count = 0
+            for i in range(len(vertices)):
+                closest_p_idx = v_indices[i]
+                dist_to_p = v_dists[i]
+                
+                if dist_to_p > self.patch_radii[closest_p_idx]:
+                    # Expand this patch to cover this vertex
+                    new_r = dist_to_p * 1.05
+                    self.patch_radii[closest_p_idx] = max(self.patch_radii[closest_p_idx], new_r)
+                    expanded_count += 1
+            
+            print(f"[Region {self.region_id}] Setup {num_p} patches. "
+                  f"Radius: mean={np.mean(self.patch_radii):.4f}, "
+                  f"expanded {expanded_count} times for coverage.")
+                  
+        else:
+            # Single patch case: Cover entire bounding box
+            bbox_min = np.min(vertices, axis=0)
+            bbox_max = np.max(vertices, axis=0)
+            bbox_diag = np.linalg.norm(bbox_max - bbox_min)
+            # If vertices are essentially a point
+            if bbox_diag < 1e-6: bbox_diag = 1.0
+            
+            self.patch_radii = np.array([bbox_diag * 0.8]) # 0.8 covers center to corner approx
+            print(f"[Region {self.region_id}] Single patch setup.")
+
+        # Store anchors for gating
+        self.anchors = vertices
+        self.anchor_tree = cKDTree(self.anchors)
 
     def fit(self, global_sdf_fn=None):
         """
@@ -141,7 +231,7 @@ class RegionReconstructor:
             points, 
             self.solvers, 
             self.patch_centers, 
-            self.patch_radii[0], # Assuming uniform radius for now as per solver signature
+            self.patch_radii, # Pass full array of radii
             device=self.device
         )
         return vals
@@ -149,37 +239,21 @@ class RegionReconstructor:
     def compute_gating(self, points: np.ndarray) -> np.ndarray:
         """
         Compute chi_i(x).
-        Simple implementation: 1 if close to mesh, decays to 0.
-        Uses nearest point distance to region mesh.
+        Uses a Plateau-based function:
+        - 1.0 if dist < margin
+        - Decays to 0.0 otherwise.
         """
-        # Query distance to mesh
-        # For batch, trimesh.nearest.on_surface is okay but maybe slow for massive queries.
-        # Use our pre-computed avg_spacing as a scale.
-        
-        # We assume points are close-ish if we are calling this? 
-        # Actually this is called globally.
-        pass # Trimesh nearest is fast enough for prototyping.
-        
-        # Optim: use pre-calculated SDF? or chamfer?
-        # Let's use Mesh BVH.
-        
         _, dists, _ = self.mesh.nearest.on_surface(points)
         
         # Gating bandwidth
-        sigma = self.avg_spacing * 5.0 # Validity domain
+        sigma = self.avg_spacing * 5.0 # Falloff width
+        margin = self.avg_spacing * self.gating_margin_ratio # Trust region
         
-        # chi = exp(- (d/sigma)^2 )? 
-        # Or strict cutoff? PDF says "1 in core, 0 outside".
-        # Smooth transition is better.
+        # Plateau logic
+        # If dist < margin, effective_dist = 0 -> chi = 1
+        effective_dist = np.maximum(0, dists - margin)
         
-        # Let's use a C2 bump or sigmoid.
-        # chi = 1 if d < sigma, else decay.
-        
-        # Let's implement simple penalty based on distance.
-        # If dist > sigma, chi -> 0.
-        
-        # chi(d) = 1.0 / (1.0 + (d/sigma)**4) # Pseudo-Butterworth
-        chi = np.exp( - (dists / sigma)**2 )
+        chi = np.exp( - (effective_dist / sigma)**2 )
         return chi
 
     def evaluate_gated(self, points: np.ndarray) -> np.ndarray:
@@ -191,4 +265,12 @@ class RegionReconstructor:
         
         # If lambda is large, this drives value huge outside region.
         return f_i + self.lambda_penalty * (1.0 - chi_i)
+
+    def compute_dist_to_region(self, points: np.ndarray) -> np.ndarray:
+        """
+        Compute minimum distance to region anchors.
+        """
+        dists, _ = self.anchor_tree.query(points, k=1)
+        return dists
+
 

@@ -4,10 +4,12 @@ import os
 import glob
 import numpy as np
 import trimesh
+import argparse
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from skimage.measure import marching_cubes
-import argparse
 
 # Add project root
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -28,9 +30,17 @@ def load_custom_mesh(base_path, name):
     vertices = np.loadtxt(nodes_file)
     faces = np.loadtxt(faces_file, dtype=int)
     
-    # Create Trimesh
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    mesh.fix_normals()
+    # Check for normals file
+    normals_file = os.path.join(base_path, f"{name}_normals.txt")
+    if os.path.exists(normals_file):
+        print(f"[Loader] Loading normals from: {normals_file}")
+        normals = np.loadtxt(normals_file)
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, vertex_normals=normals, process=False)
+    else:
+        print("[Loader] No normals file found, computing normals...")
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        mesh.fix_normals()
+    
     return mesh
 
 def plot_4view(mesh, output_path):
@@ -67,6 +77,13 @@ def plot_4view(mesh, output_path):
         ax.set_ylim(mid[1]-rng, mid[1]+rng)
         ax.set_zlim(mid[2]-rng, mid[2]+rng)
         
+        # Ensure the 3D plot box is cubic (equal aspect ratio)
+        try:
+            ax.set_box_aspect([1, 1, 1])
+        except AttributeError:
+            # Fallback for older matplotlib versions
+            pass
+        
         ax.view_init(elev=elev_azim[0], azim=elev_azim[1])
         ax.set_axis_off()
         
@@ -76,7 +93,7 @@ def plot_4view(mesh, output_path):
 
 def main():
     asset_dir = os.path.join(os.path.dirname(__file__), '../assets/nonsmooth_geometry')
-    asset_name = "TruncatedRing"
+    asset_name = "Cylinder"
     
     print(f"[Process] Loading {asset_name} from {asset_dir}...")
     mesh = load_custom_mesh(asset_dir, asset_name)
@@ -112,25 +129,14 @@ def main():
     os.makedirs(figures_dir, exist_ok=True)
     
     # Ensure output dir exists
-    output_dir = os.path.join(os.path.dirname(__file__), '../output')
+    output_dir = os.path.join(os.path.dirname(__file__), '../output/ply')
     os.makedirs(output_dir, exist_ok=True)
     
-    output_ply = os.path.join(output_dir, "TruncatedRing_reconstructed.ply")
+    output_ply = os.path.join(output_dir, f"{asset_name}_reconstructed.ply")
     
-    if os.path.exists(output_ply):
-        print(f"[Process] Found existing {output_ply}. Skipping reconstruction.")
-        rec_mesh = trimesh.load(output_ply)
-        # Verify it loaded as mesh
-        if isinstance(rec_mesh, trimesh.Scene):
-             if len(rec_mesh.geometry) > 0:
-                 rec_mesh = list(rec_mesh.geometry.values())[0]
-             else:
-                 print("Error loading PLY as scene.")
-                 
-        output_png = os.path.join(figures_dir, "TruncatedRing_4view.png")
-        plot_4view(rec_mesh, output_png)
-        print(f"[Process] Saved PNG to {output_png}")
-        return
+    # If the user wants to always overwrite, we remove the skip logic.
+    # We can still keep the output path definition.
+    output_ply = os.path.join(output_dir, f"{asset_name}_reconstructed.ply")
 
     print("[Process] Extracting Iso-surface...")
     # Bounding box + padding
@@ -170,7 +176,7 @@ def main():
         print(f"[Process] Saved PLY to {output_ply}")
         
         # Save 4-view
-        output_png = os.path.join(figures_dir, "TruncatedRing_4view.png")
+        output_png = os.path.join(figures_dir, f"{asset_name}_4view.png")
         plot_4view(rec_mesh, output_png)
         print(f"[Process] Saved PNG to {output_png}")
         
